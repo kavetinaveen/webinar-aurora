@@ -1,0 +1,354 @@
+---
+title: "Amazon Reviews Classification"
+author: "Naveen Kaveti"
+date: "6/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, comment = NA, message = FALSE)
+
+library(data.table)
+library(knitr)
+library(kableExtra)
+library(stringr)
+library(stopwords)
+library(spacyr)
+library(superml)
+library(keras)
+library(h2o)
+library(text2vec)
+library(tensorflow)
+library(yardstick)
+library(ggplot2)
+h2o.init()
+h2o.no_progress()
+```
+
+
+### Problem Statement:
+
+Amazon classifies product reviews into positive and critical for better user experience in the product.
+
+![](amazon_reviews_image.png)
+
+### Data:
+
+```{r}
+df <- fread('./amazonreviews.tsv')
+head(df) %>% 
+  kable() %>%
+  kable_styling()
+```
+
+**Statistics:**
+
+Number of total reviews: `r nrow(df)`
+
+Number of positive reviews: `r nrow(df[label == 'pos'])` (`r round((nrow(df[label == 'pos'])/nrow(df))*100, 2)`%)
+
+Number of negative reviews: `r nrow(df[label == 'neg'])` (`r round((nrow(df[label == 'neg'])/nrow(df))*100, 2)`%)
+
+```{r}
+# Converting label to binary (1: Positive; 0: Negative)
+df$label <- ifelse(df$label == 'pos', 1, 0)
+```
+
+
+### Text preprocessing
+
+**Step 1:** Removing special characters and trimming extra white spaces
+
+```{r eval=FALSE}
+Stuning even for the non-gamer: This sound track was beautiful! It paints the senery in your mind so well I would recomend it even to people who hate vid. game music! I have played the game Chrono Cross but out of all of the games I have ever played it has the best music! It backs away from crude keyboarding and takes a fresher step with grate guitars and soulful orchestras. It would impress anyone who cares to listen! ^_^
+```
+
+
+```{r}
+review <- df$review[1]
+review_cleaned <- trimws(str_replace_all(review, "[^[:alnum:]]", " "))
+review_cleaned <- gsub("\\s+", " ", str_trim(review_cleaned))
+print(review_cleaned)
+```
+
+Regular expressions are useful to search patterns in the text. Refer [this](https://stat.ethz.ch/R-manual/R-devel/library/base/html/regex.html#:~:text=A%20'regular%20expression'%20is%20a,use%20a%20literal%20regular%20expression.) document for more information.
+
+
+**Step 2:** Removing stop words
+
+```{r}
+stopwords('en')
+```
+
+```{r}
+stopwords_regex = paste(stopwords('en'), collapse = '\\b|\\b')
+stopwords_regex = paste0('\\b', stopwords_regex, '\\b')
+
+review_cleaned_without_stopwords <- tolower(review_cleaned)
+review_cleaned_without_stopwords <- str_replace_all(review_cleaned_without_stopwords, stopwords_regex, '')
+review_cleaned_without_stopwords <- gsub("\\s+", " ", str_trim(review_cleaned_without_stopwords))
+print(review_cleaned_without_stopwords)
+```
+
+**Step 3:** Stemming and Lemmatization
+
+```{r}
+spacy_initialize()
+parsedtxt <- spacy_parse(review_cleaned_without_stopwords, entity = FALSE)
+parsedtxt %>% 
+  kable() %>%
+  kable_styling() %>% 
+  scroll_box(width = "100%", height = "400px")
+```
+
+Refer [this](https://www.rdocumentation.org/packages/spacyr/versions/0.9.91) document for more information about Spacy
+
+Stemming and Lemmatizations are two techniques used for normalizing text. The major difference between stemming and lemmatization is, stemming do not check for english vocabulary while lemmatization checks for english vocabulary.
+
+**Step 4:** Extracting entities
+
+```{r}
+parsedtxt_ent <- spacy_parse(review_cleaned, lemma = FALSE)
+entity_extract(parsedtxt_ent) %>% 
+  kable() %>%
+  kable_styling()
+```
+
+### Preprocessing on entire data
+
+```{r}
+# Preprocessing entire corpus
+df[, review_processed := str_replace_all(review, "[^[:alnum:]]", " ")]
+df[, review_processed := tolower(review_processed)]
+df[, review_processed := str_replace_all(review_processed, stopwords_regex, '')]
+df[, review_processed := gsub("\\s+", " ", str_trim(review_processed))]
+```
+
+### Feature extraction
+
+#### Count vectorizer:
+
+$$Tf(w, d) = Number \ of \ times \ word \ `w` \ appears \ in \ document \ `d`$$
+
+```{r}
+# initialise the class
+countVec <- CountVectorizer$new(max_features = 100, remove_stopwords = FALSE, min_df = 0.2, max_df = 0.8)
+ 
+# generate the matrix
+countVecMat <- countVec$fit_transform(df$review_processed)
+countVecMat <- data.table(countVecMat)
+countVecMat$label <- df$label
+
+head(countVecMat, 10) %>% 
+  kable() %>%
+  kable_styling() %>% 
+  scroll_box(width = "100%", height = "400px")
+```
+
+Where each cell represents number of times word `w` appears in document `d`.
+
+**Let's dig into parameters:**
+
+* max_features: int, Number of features
+
+* remove_stopwords: boolean, To remove stopwords
+
+* min_df: value between 0 and 1, ignore terms that have a document frequency strictly higher than the given threshold
+
+* max_df: value between 0 and 1, ignore terms that have a document frequency strictly lower than the given threshold
+
+#### TF-IDF (Term Frequency - Inverse Document Frequency):
+
+The main drawback of count vectorizer is, it is biased to high frequent words. Meaning, if a word is high frequenct then count vectorizer gives high importance to those words but in real word scenrio it might not be true. So inverse document frequency penalizes when term frequency is very high.
+
+
+$$Tf(w, d) = Number \ of \ times \ word \ `w` \ appears \ in \ document \ `d`$$
+
+$$IDF(w) = \log \frac{Total \ number \ of \ documents}{Number \ of \ documents \ with \ word \ `w`}$$
+
+$$Tfidf(w, d) = Tf(w, d) * IDF(w)$$
+
+```{r}
+# initialise the class
+tfidfVec <- TfIdfVectorizer$new(max_features = 100, remove_stopwords = FALSE, min_df = 0.2, max_df = 0.8, ngram_range = c(1, 3))
+
+# generate the matrix
+tfidfVecMat <- tfidfVec$fit_transform(df$review_processed)
+tfidfVecMat <- data.table(tfidfVecMat)
+tfidfVecMat$label <- df$label
+
+head(tfidfVecMat, 10) %>% 
+  kable() %>%
+  kable_styling() %>% 
+  scroll_box(width = "100%", height = "400px")
+```
+
+
+**ngram_range:** c(1, 3), this will consider all uni, bi and tri grams tfidf metrics. uni-gram is one word, bi-gram is consecutive two words and tri-gram is consecutive three words. Importance of this feature is, if a user writes `product is not good` or `product is not that bad` and if we consider each word individually then our model will get confused. So in such cases we should consider bi or tri grams to get the context around the word.
+
+
+#### Word2Vec:
+
+```{r eval = FALSE}
+# Creating word index for the review vocabulary
+GLOVE_DIR <- 'glove.6B'
+EMBEDDING_DIM <- 100
+texts <- df$review_processed
+tokenizer <- text_tokenizer(num_words=100000)
+tokenizer %>% fit_text_tokenizer(texts)
+save_text_tokenizer(tokenizer, "tokenizer")
+sequences <- texts_to_sequences(tokenizer, texts)
+word_index <- tokenizer$word_index
+
+# Creating embedding index with 100-dimensional values
+embeddings_index <- new.env(parent = emptyenv())
+lines <- readLines(file.path(GLOVE_DIR, 'glove.6B.100d.txt'))
+for (line in lines) {
+  values <- strsplit(line, ' ', fixed = TRUE)[[1]]
+  word <- values[[1]]
+  coefs <- as.numeric(values[-1])
+  embeddings_index[[word]] <- coefs
+}
+
+# prepare embedding matrix
+num_words <- length(word_index)
+prepare_embedding_matrix <- function() {
+  embedding_matrix <- matrix(0L, nrow = num_words, ncol = EMBEDDING_DIM)
+  for(word in names(word_index)){
+    index <- word_index[[word]]
+    embedding_vector <- embeddings_index[[word]]
+    if(!is.null(embedding_vector)){
+      # words not found in embedding index will be all-zeros.
+      embedding_matrix[index,] <- embedding_vector
+    }
+  }
+  embedding_matrix
+}
+```
+
+
+```{r}
+embedding_matrix <- fread('embedding_matrix.csv')
+row_names <- embedding_matrix$row_names
+embedding_matrix$row_names <- NULL
+embedding_matrix <- as.matrix(embedding_matrix)
+row.names(embedding_matrix) <- row_names
+
+# Function to identify similar words for a given word
+find_similar_words <- function(word, n = 5){
+  similarities <- embedding_matrix[word, , drop = FALSE] %>%
+    sim2(embedding_matrix, y = ., method = "cosine")
+  
+  similarities[,1] %>% sort(decreasing = TRUE) %>% head(n)
+}
+
+```
+
+So far we learned how to extract features from text data using term frequencies and inverse document frequencies but in either of these cases we are not considering semantics of words. Researchers trained deep learning models to provide mathematical descriptions of individual words such that words that appear frequently together in the language will have similar values.
+
+![](word2vec_image.png)
+
+CBOW (Continuous Bag Of Words) and Skip-gram are two famous training frameworks to train the word2vec model.
+
+CBOW takes context around the word as input and predicts the word, whereas skip-gram takes an individual word as input and predicts context around that word.
+
+**Few examples:**
+
+```{r}
+find_similar_words("king")
+```
+
+```{r}
+find_similar_words("good")
+```
+
+```{r}
+find_similar_words("bad")
+```
+
+```{r}
+find_similar_words("learning")
+```
+
+```{r}
+find_similar_words("product")
+```
+
+**Preparing word embeddings for review data: **
+
+```{r}
+load('sequences.RData')
+word_embeddings_df <- data.table(do.call('rbind', lapply(sequences, function(x){colMeans(embedding_matrix[x, ])})))
+word_embeddings_df$label <- df$label
+```
+
+### Training a binary classifier
+
+```{r}
+get_classifier <- function(df){
+  response <- 'label'
+  predictors <- setdiff(colnames(df), response)
+  
+  set.seed(123)
+  train_ind = sample(seq_len(nrow(df)),size = round(nrow(df)*0.7))
+  
+  train <- df[train_ind, ]
+  test <- df[-train_ind, ]
+  
+  train_h2o <- as.h2o(train)
+  test_h2o <- as.h2o(test)
+  
+  rf_model <- h2o.randomForest(x = predictors, y = response, training_frame = train_h2o, nfolds = 5, seed = 1234)
+  test$pred_prob <- as.data.frame.array(predict(rf_model, test_h2o))
+  test$pred_label <- 1
+  test$pred_label[test$pred_prob < 0.5] = 0
+  
+  test$label <- as.factor(test$label)
+  test$pred_label <- as.factor(test$pred_label)
+  
+  cm <- conf_mat(test, 'label', 'pred_label')
+  g_plot <- autoplot(cm, type = "heatmap") + scale_fill_gradient(low="#D6EAF8",high = "#2E86C1")
+  
+  accuracy <- round((sum(diag(cm$table))/sum(cm$table))*100, 2)
+  print(paste0("Accuracy (Number of correct classifications/Total number of cases): ", accuracy, "%"))
+  
+  return(list(test[, .(label, pred_label)], g_plot))
+}
+```
+
+#### Using Count Vectorizer
+
+```{r}
+results_cv <- get_classifier(countVecMat)
+results_cv[[2]]
+```
+
+#### Using Tfidf Vectorizer
+
+```{r}
+results_tfidf <- get_classifier(tfidfVecMat)
+results_tfidf[[2]]
+```
+
+#### Using Word Embeddings
+
+```{r}
+results_wv <- get_classifier(word_embeddings_df)
+results_wv[[2]]
+```
+
+### Summary
+
+* The three main steps of any text analysis are:
+
+  - Text pre-processing
+  - Feature extraction
+  - Model building
+
+### Conclusion
+
+It is not mandatory that more advanced techniques will give us better results always. All depends on data, if data is simple and problem is straight-forward then using more complicated methods may worse the results.
+
+
+
+
